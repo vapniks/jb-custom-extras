@@ -76,6 +76,7 @@
 (require 'cl-lib)
 (require 'cus-edit)
 (require 'wid-edit)
+(require 'cats)
 
 ;;; Code:
 
@@ -249,6 +250,23 @@
     (or (seq-find #'admits-p (seq-filter #'matches-p alts))
         (error "No alternative of %S matches %S and admits path %S" alts value path))))
 
+(defun custom-type--step (state step)
+  "STATE is (TYPE VALUE PUT).  Return Either ERROR (TYPE VALUE PUT)."
+  (pcase-let ((`(,type ,value ,put) state)
+              (nt (custom-type--norm type))
+              (step (pcase step ('key 0) ('value 'cdr) ('car 0) ('cadr 1) ('caddr 2) (s s))))
+    (cats-do
+     (:= nt (if (and (memq (car nt) '(choice radio)) (not (eq (car-safe step) 'alt)))
+		(custom-type--resolve-choice (cdr nt) value step) ; now also Either
+	      (cats-right nt)))
+     (:= `(,sub ,subval ,put2)
+	 (pcase (cons nt step)
+	   (`((cons ,k ,_) . 0)
+	    (cats-right (list k (car value) (lambda (x) (cons x (cdr value))))))
+	   ;; … remaining clauses, each wrapped in cats-right …
+	   (_ (cats-left (format "Cannot take step %S into type %S" step type)))))
+     (cats-return (list sub subval (lambda (x) (funcall put (funcall put2 x))))))))
+
 (defun custom-type-focus (type value path)
   "Follow PATH into VALUE, an instance of the custom TYPE.
 
@@ -300,42 +318,8 @@ whose value is ((\"a\" . 1) (\"b\" . 2)), the path (1 value) yields (integer 2 P
 and (funcall PUT 5) returns \((\"a\" . 1) (\"b\" . 5)).
 For type (repeat (list string function)) with an analogous value, the path (1 1)
 focuses on the function of the second entry."
-  ;; Note: this won't work properly without `lexical-binding' enabled
-  (if (null path)
-      (list type value #'identity)
-    (let* ((step (pcase (car path) ('key 0) ('value 'cdr) ('car 0) ('cadr 1) ('caddr 2)
-			('cadddr 3) ('first 0) ('second 1) ('third 2) ('fourth 3) ('fifth 4)
-			('sixth 5) ('seventh 5) ('eighth 7) ('ninth 8) ('tenth 9) (s s)))
-           (nt (custom-type--norm type))
-           (put-nth (lambda (x) (let ((l (length value)))
-				  (if (= n l) (append value (list x))
-				    (if (or (> n l) (< n 0))
-					(error "Invalid index: %S (should be between 0 & %S)" n l)
-				      (let ((c (copy-sequence value)))
-					(setf (nth n c) x)
-					c)))))))
-      ;; Resolve an implicit choice by matching VALUE and PATH, without consuming a step.
-      (while (and (memq (car nt) '(choice radio)) (not (eq (car-safe step) 'alt)))
-        (setq nt (custom-type--norm
-                  (or (custom-type--resolve-choice (cdr nt) value path)
-		      (error "Value %S matches no branch of %S" value type)))))
-      (pcase-let ((`(,subtype ,subval ,put)
-                   (pcase (cons nt step)
-                     (`((cons ,k ,_) . 0)
-                      (list k (car value) (lambda (x) (cons x (cdr value)))))
-                     (`((cons ,_ ,v) . cdr)
-                      (list v (cdr value) (lambda (x) (cons (car value) x))))
-                     (`((repeat ,e) . ,(and (pred natnump) n))
-                      (list e (nth n value) (funcall put-nth n)))
-                     (`((,(or 'list 'group) . ,es) . ,(and (pred natnump) n))
-                      (list (nth n es) (nth n value) (funcall put-nth n)))
-                     (`((,(or 'list 'group) ,_ . ,es) . cdr)
-                      (list (cons 'list es) (cdr value) (lambda (x) (cons (car value) x))))
-                     (`((,(or 'choice 'radio) . ,alts) . (alt ,n))
-                      (list (nth n alts) value #'identity))
-                     (_ (error "Cannot take step %S into type %S" (car path) type)))))
-        (pcase-let ((`(,subtype2 ,subval2 ,put2) (custom-type-focus subtype subval (cdr path))))
-          (list subtype2 subval2 (lambda (x) (funcall put (funcall put2 x)))))))))
+  (cl-reduce (lambda (acc step) (cats-bind acc (lambda (st) (custom-type--step st step))))
+             path :initial-value (cats-right (list type value #'identity))))
 
 ;; TODO: function for converting customization type with X in it to path to X (for use with `custom-type-focus')
 ;;       function for searching customization types by type/subtype/path/subpath
